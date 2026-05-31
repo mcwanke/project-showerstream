@@ -1,0 +1,23 @@
+water_meter:
+  flow_rate: sensor.your_water_flow_rate_entity
+  volume: sensor.your_water_volume_entity
+
+bathrooms:
+  bath1:
+    humidity: sensor.your_bath1_humidity_entity
+    humidity_avg_12h: sensor.your_bath1_humidity_average_entity
+    temperature: sensor.your_bath1_temperature_entity
+    lights:
+      - light.your_bath1_light_1
+      - light.your_bath1_light_2  # remove if only one light
+  bath2:
+    humidity: sensor.your_bath2_humidity_entity
+    humidity_avg_12h: sensor.your_bath2_humidity_average_entity
+    temperature: sensor.your_bath2_temperature_entity
+    lights:
+      - light.your_bath2_light_1
+  bath3:
+    humidity: sensor.your_bath3_humidity_entity
+    humidity_avg_12h: sensor.your_bath3_humidity_average_entity
+    temperature: sensor.your_bath3_temperature_entity
+    # bath3 has no smart lights
