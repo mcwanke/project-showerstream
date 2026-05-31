@@ -32,6 +32,8 @@ services:
 
   ha-producer:
     build: ./ha-producer
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
     env_file: .env
     depends_on:
       - redpanda

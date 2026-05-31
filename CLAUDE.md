@@ -40,7 +40,7 @@ Project decisions and deferred work are tracked in `memory/`. This folder is git
 
 Read memory/MEMORY.md at the start of every session. Never contradict a logged decision without flagging it first.
 
-When I say "session end", "wrapping up", or "let's stop here": ask me "Ready to write session summary to memory/MEMORY.md?" and wait for confirmation before writing. Include: Worked on / Completed / In progress / Decisions made / Next session priorities.
+When I say "END SESSION" or "end session": ask me "Ready to write session summary to memory/MEMORY.md?", provide a short bullet point summary list of what you would write, and wait for confirmation before writing. Include: Worked on / Completed / In progress / Decisions made / Next session priorities. Once this is done remind me to commit to github if needed.
 
 Maintain a file called memory/ERRORS.md. When an approach takes more than 2 attempts to work, ask me "Ready to log this to memory/ERRORS.md?" and wait for confirmation before writing. Check memory/ERRORS.md before suggesting approaches to similar tasks.
 

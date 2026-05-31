@@ -1,0 +1,4 @@
+websockets
+kafka-python
+python-dotenv
+pyyaml
