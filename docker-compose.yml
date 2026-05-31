@@ -1,0 +1,47 @@
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+      - --rpc-addr redpanda:33145
+      - --advertise-rpc-addr redpanda:33145
+      - --smp 1
+      - --memory 1G
+      - --mode dev-container
+      - --default-log-level=info
+    ports:
+      - "19092:19092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    networks:
+      - network_apps
+
+  redpanda-console:
+    image: docker.redpanda.com/redpandadata/console:latest
+    environment:
+      KAFKA_BROKERS: redpanda:9092  # verify: may need CONSOLE_KAFKA_BROKERS on older images
+    ports:
+      - "8180:8080"
+    depends_on:
+      - redpanda
+    networks:
+      - network_apps
+
+  ha-producer:
+    build: ./ha-producer
+    env_file: .env
+    depends_on:
+      - redpanda
+    restart: unless-stopped
+    networks:
+      - network_apps
+
+volumes:
+  redpanda-data:
+
+networks:
+  network_apps:
+    external: true
