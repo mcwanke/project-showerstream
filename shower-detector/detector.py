@@ -25,6 +25,16 @@ HUMIDITY_WINDOW_SECONDS = 180
 CONFIG_PATH = "/app/config.yaml"
 RETRY_DELAY = 5
 
+ATTRIBUTION_CONFIRMED_THRESHOLD: float = float(os.getenv("ATTRIBUTION_CONFIRMED_THRESHOLD", "0.6"))
+ATTRIBUTION_MIN_THRESHOLD: float = float(os.getenv("ATTRIBUTION_MIN_THRESHOLD", "0.3"))
+BATHROOM_PRIORITY_ORDER: list[str] = [
+    b.strip() for b in os.getenv("BATHROOM_PRIORITY_ORDER", "").split(",") if b.strip()
+]
+HUMIDITY_SLOPE_NORM: float = float(os.getenv("HUMIDITY_SLOPE_NORM", "0.05"))
+HUMIDITY_DELTA_NORM: float = float(os.getenv("HUMIDITY_DELTA_NORM", "15.0"))
+TEMPERATURE_SLOPE_NORM: float = float(os.getenv("TEMPERATURE_SLOPE_NORM", "0.02"))
+TEMPERATURE_DELTA_NORM: float = float(os.getenv("TEMPERATURE_DELTA_NORM", "5.0"))
+
 
 def load_bathroom_ids() -> list[str]:
     with open(CONFIG_PATH) as f:
@@ -42,6 +52,7 @@ def parse_timestamp(ts_str: str) -> datetime:
 class SessionManager:
     def __init__(self, bathroom_ids: list[str], producer: AIOKafkaProducer) -> None:
         self._producer = producer
+        self._bathroom_ids = bathroom_ids
 
         self._session_id: Optional[str] = None
         self._started_at: Optional[datetime] = None
@@ -54,6 +65,18 @@ class SessionManager:
         self._temperature_history: dict[str, deque] = {bid: deque() for bid in bathroom_ids}
         self._baselines: dict[str, dict[str, float]] = {bid: {} for bid in bathroom_ids}
         self._device_states: dict[str, dict[str, Any]] = {bid: {} for bid in bathroom_ids}
+
+        # Peak signal tracking — reset each session
+        self._humidity_peak_slope: dict[str, float] = {bid: 0.0 for bid in bathroom_ids}
+        self._humidity_peak_delta: dict[str, float] = {bid: 0.0 for bid in bathroom_ids}
+        self._temperature_peak_slope: dict[str, float] = {bid: 0.0 for bid in bathroom_ids}
+        self._temperature_peak_delta: dict[str, float] = {bid: 0.0 for bid in bathroom_ids}
+        self._scores: dict[str, float] = {bid: 0.0 for bid in bathroom_ids}
+
+        # Device seen-state — whether each signal was ever True during the session
+        self._light_shower_seen: dict[str, bool] = {bid: False for bid in bathroom_ids}
+        self._light_room_seen: dict[str, bool] = {bid: False for bid in bathroom_ids}
+        self._fan_seen: dict[str, bool] = {bid: False for bid in bathroom_ids}
 
     @property
     def _session_open(self) -> bool:
@@ -113,6 +136,7 @@ class SessionManager:
         started_at = self._started_at
         volume = self._volume_accumulated
 
+        bathroom_id, confidence_score, attribution_state = self._attribute_session()
         self._reset_session()
 
         if duration_seconds < MIN_SHOWER_DURATION_SECONDS:
@@ -120,7 +144,50 @@ class SessionManager:
             return
 
         log.info("session %s closing — %.0fs, %.2f gal", session_id, duration_seconds, volume)
-        await self._emit_session(session_id, started_at, ended_at, duration_seconds, volume)
+        await self._emit_session(
+            session_id, started_at, ended_at, duration_seconds, volume,
+            bathroom_id, confidence_score, attribution_state,
+        )
+
+    def _attribute_session(self) -> tuple[str, float, str]:
+        for bid in self._bathroom_ids:
+            self._scores[bid] = self._compute_score(bid)
+
+        winner = max(self._bathroom_ids, key=lambda b: self._scores[b])
+        score = self._scores[winner]
+
+        if score >= ATTRIBUTION_CONFIRMED_THRESHOLD:
+            state = "CONFIRMED"
+        elif score >= ATTRIBUTION_MIN_THRESHOLD:
+            state = "ATTRIBUTED"
+        else:
+            state = "FALLBACK"
+            priority = [b for b in BATHROOM_PRIORITY_ORDER if b in self._scores]
+            if priority:
+                winner = priority[0]
+                score = self._scores[winner]
+
+        log.info(
+            "attribution: %s | scores: %s | state: %s",
+            winner,
+            {b: round(self._scores[b], 3) for b in self._bathroom_ids},
+            state,
+        )
+        return winner, score, state
+
+    def _compute_score(self, bathroom_id: str) -> float:
+        h_slope = min(self._humidity_peak_slope[bathroom_id] / HUMIDITY_SLOPE_NORM, 1.0) * 0.30
+        h_delta = min(max(self._humidity_peak_delta[bathroom_id], 0.0) / HUMIDITY_DELTA_NORM, 1.0) * 0.25
+        t_slope = min(self._temperature_peak_slope[bathroom_id] / TEMPERATURE_SLOPE_NORM, 1.0) * 0.15
+        t_delta = min(max(self._temperature_peak_delta[bathroom_id], 0.0) / TEMPERATURE_DELTA_NORM, 1.0) * 0.15
+        l_shower = 0.05 if self._light_shower_seen[bathroom_id] else 0.0
+        l_room = 0.05 if self._light_room_seen[bathroom_id] else 0.0
+        fan = 0.05 if self._fan_seen[bathroom_id] else 0.0
+        return h_slope + h_delta + t_slope + t_delta + l_shower + l_room + fan
+
+    def _recompute_score(self, bathroom_id: str) -> None:
+        self._scores[bathroom_id] = self._compute_score(bathroom_id)
+        log.debug("scores: %s", {b: round(self._scores[b], 3) for b in self._bathroom_ids})
 
     def _reset_session(self) -> None:
         self._session_id = None
@@ -129,6 +196,14 @@ class SessionManager:
         self._last_flow_rate = 0.0
         self._volume_accumulated = 0.0
         self._close_task = None
+        self._humidity_peak_slope = {bid: 0.0 for bid in self._bathroom_ids}
+        self._humidity_peak_delta = {bid: 0.0 for bid in self._bathroom_ids}
+        self._temperature_peak_slope = {bid: 0.0 for bid in self._bathroom_ids}
+        self._temperature_peak_delta = {bid: 0.0 for bid in self._bathroom_ids}
+        self._scores = {bid: 0.0 for bid in self._bathroom_ids}
+        self._light_shower_seen = {bid: False for bid in self._bathroom_ids}
+        self._light_room_seen = {bid: False for bid in self._bathroom_ids}
+        self._fan_seen = {bid: False for bid in self._bathroom_ids}
 
     async def _emit_session(
         self,
@@ -137,16 +212,19 @@ class SessionManager:
         ended_at: datetime,
         duration_seconds: float,
         volume_gallons: float,
+        bathroom_id: str,
+        confidence_score: float,
+        attribution_state: str,
     ) -> None:
         payload = {
             "session_id": session_id,
-            "bathroom_id": None,
-            "attribution_state": "UNATTRIBUTED",
+            "bathroom_id": bathroom_id,
+            "attribution_state": attribution_state,
             "started_at": started_at.isoformat(),
             "ended_at": ended_at.isoformat(),
             "duration_seconds": int(duration_seconds),
             "volume_gallons": round(volume_gallons, 3),
-            "confidence_score": None,
+            "confidence_score": round(confidence_score, 3),
             "cost_estimate": None,
         }
         await self._producer.send("home.showers", value=json.dumps(payload).encode())
@@ -158,26 +236,69 @@ class SessionManager:
             return
 
         ts = parse_timestamp(msg.get("timestamp", ""))
-        cutoff = ts.timestamp() - HUMIDITY_WINDOW_SECONDS
+        ts_float = ts.timestamp()
+        cutoff = ts_float - HUMIDITY_WINDOW_SECONDS
 
         if "humidity" in msg:
+            new_val: float = msg["humidity"]
             dq = self._humidity_history[bathroom_id]
-            dq.append((ts.timestamp(), msg["humidity"]))
+            if self._session_open and dq:
+                prev_ts, prev_val = dq[-1]
+                elapsed = ts_float - prev_ts
+                if elapsed > 0:
+                    slope = (new_val - prev_val) / elapsed
+                    if slope > self._humidity_peak_slope[bathroom_id]:
+                        self._humidity_peak_slope[bathroom_id] = slope
+            dq.append((ts_float, new_val))
             while dq and dq[0][0] < cutoff:
                 dq.popleft()
+            if self._session_open:
+                baseline = self._baselines[bathroom_id].get("humidity_avg_12h")
+                if baseline is not None:
+                    delta = new_val - baseline
+                    if delta > self._humidity_peak_delta[bathroom_id]:
+                        self._humidity_peak_delta[bathroom_id] = delta
+
         elif "temperature" in msg:
+            new_val = msg["temperature"]
             dq = self._temperature_history[bathroom_id]
-            dq.append((ts.timestamp(), msg["temperature"]))
+            if self._session_open and dq:
+                prev_ts, prev_val = dq[-1]
+                elapsed = ts_float - prev_ts
+                if elapsed > 0:
+                    slope = (new_val - prev_val) / elapsed
+                    if slope > self._temperature_peak_slope[bathroom_id]:
+                        self._temperature_peak_slope[bathroom_id] = slope
+            dq.append((ts_float, new_val))
             while dq and dq[0][0] < cutoff:
                 dq.popleft()
+            if self._session_open:
+                baseline = self._baselines[bathroom_id].get("temperature_avg_12h")
+                if baseline is not None:
+                    delta = new_val - baseline
+                    if delta > self._temperature_peak_delta[bathroom_id]:
+                        self._temperature_peak_delta[bathroom_id] = delta
+
         elif "humidity_avg_12h" in msg:
             self._baselines[bathroom_id]["humidity_avg_12h"] = msg["humidity_avg_12h"]
+
         elif "temperature_avg_12h" in msg:
             self._baselines[bathroom_id]["temperature_avg_12h"] = msg["temperature_avg_12h"]
+
         else:
             for key, val in msg.items():
                 if key not in ("timestamp", "bathroom_id"):
                     self._device_states[bathroom_id][key] = val
+                    if self._session_open and val is True:
+                        if key == "light_shower":
+                            self._light_shower_seen[bathroom_id] = True
+                        elif key.startswith("light_"):
+                            self._light_room_seen[bathroom_id] = True
+                        elif key.startswith("fan_"):
+                            self._fan_seen[bathroom_id] = True
+
+        if self._session_open:
+            self._recompute_score(bathroom_id)
 
 
 async def consume_water(manager: SessionManager) -> None:
