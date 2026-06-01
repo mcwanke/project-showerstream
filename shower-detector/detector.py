@@ -122,6 +122,8 @@ class SessionManager:
                 await asyncio.sleep(SCORE_EMIT_INTERVAL_SECONDS)
                 if not self._session_open:
                     break
+                if max(self._scores.values(), default=0.0) == 0.0:
+                    continue
                 payload = {
                     "session_id": self._session_id,
                     "timestamp": datetime.now(timezone.utc).isoformat(),

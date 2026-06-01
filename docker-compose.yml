@@ -41,6 +41,26 @@ services:
     networks:
       - network_apps
 
+  shower-detector:
+    build: ./shower-detector
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    env_file: .env
+    depends_on:
+      - redpanda
+    restart: unless-stopped
+    networks:
+      - network_apps
+
+  influxdb-sink:
+    build: ./influxdb-sink
+    env_file: .env
+    depends_on:
+      - redpanda
+    restart: unless-stopped
+    networks:
+      - network_apps
+
 volumes:
   redpanda-data:
 

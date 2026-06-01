@@ -1,0 +1,3 @@
+aiokafka
+influxdb-client[async]
+python-dotenv
