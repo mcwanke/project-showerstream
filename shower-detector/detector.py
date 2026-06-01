@@ -35,6 +35,7 @@ HUMIDITY_DELTA_NORM: float = float(os.getenv("HUMIDITY_DELTA_NORM", "15.0"))
 TEMPERATURE_SLOPE_NORM: float = float(os.getenv("TEMPERATURE_SLOPE_NORM", "0.02"))
 TEMPERATURE_DELTA_NORM: float = float(os.getenv("TEMPERATURE_DELTA_NORM", "5.0"))
 SCORE_EMIT_INTERVAL_SECONDS: int = int(os.getenv("SCORE_EMIT_INTERVAL_SECONDS", "30"))
+WATER_COST_PER_GALLON: float = float(os.getenv("WATER_COST_PER_GALLON", "0.018"))
 
 
 def load_bathroom_ids() -> list[str]:
@@ -254,7 +255,7 @@ class SessionManager:
             "volume_gallons": round(volume_gallons, 3),
             "confidence_score": round(confidence_score, 3),
             "scores": all_scores,
-            "cost_estimate": None,
+            "cost_estimate": round(volume_gallons * WATER_COST_PER_GALLON, 4),
         }
         try:
             await self._producer.send("home.showers", value=json.dumps(payload).encode())
