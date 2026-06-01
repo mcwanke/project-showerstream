@@ -34,6 +34,7 @@ HUMIDITY_SLOPE_NORM: float = float(os.getenv("HUMIDITY_SLOPE_NORM", "0.05"))
 HUMIDITY_DELTA_NORM: float = float(os.getenv("HUMIDITY_DELTA_NORM", "15.0"))
 TEMPERATURE_SLOPE_NORM: float = float(os.getenv("TEMPERATURE_SLOPE_NORM", "0.02"))
 TEMPERATURE_DELTA_NORM: float = float(os.getenv("TEMPERATURE_DELTA_NORM", "5.0"))
+SCORE_EMIT_INTERVAL_SECONDS: int = int(os.getenv("SCORE_EMIT_INTERVAL_SECONDS", "30"))
 
 
 def load_bathroom_ids() -> list[str]:
@@ -60,6 +61,7 @@ class SessionManager:
         self._last_flow_rate: float = 0.0
         self._volume_accumulated: float = 0.0
         self._close_task: Optional[asyncio.Task] = None
+        self._score_emit_task: Optional[asyncio.Task] = None
 
         self._humidity_history: dict[str, deque] = {bid: deque() for bid in bathroom_ids}
         self._temperature_history: dict[str, deque] = {bid: deque() for bid in bathroom_ids}
@@ -111,7 +113,26 @@ class SessionManager:
         self._last_water_ts = ts
         self._last_flow_rate = flow_rate
         self._volume_accumulated = 0.0
+        self._score_emit_task = asyncio.create_task(self._score_emit_loop())
         log.info("session opened: %s", self._session_id)
+
+    async def _score_emit_loop(self) -> None:
+        try:
+            while self._session_open:
+                await asyncio.sleep(SCORE_EMIT_INTERVAL_SECONDS)
+                if not self._session_open:
+                    break
+                payload = {
+                    "session_id": self._session_id,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "scores": {b: round(self._scores[b], 3) for b in self._bathroom_ids},
+                }
+                try:
+                    await self._producer.send("home.shower_scores", value=json.dumps(payload).encode())
+                except Exception as exc:
+                    log.error("failed to emit score update for session %s: %s", self._session_id, exc)
+        except asyncio.CancelledError:
+            pass
 
     def _accumulate_volume(self, flow_rate: float, ts: datetime) -> None:
         if self._last_water_ts is not None:
@@ -137,6 +158,7 @@ class SessionManager:
         volume = self._volume_accumulated
 
         bathroom_id, confidence_score, attribution_state = self._attribute_session()
+        all_scores = {b: round(self._scores[b], 3) for b in self._bathroom_ids}
         self._reset_session()
 
         if duration_seconds < MIN_SHOWER_DURATION_SECONDS:
@@ -146,7 +168,7 @@ class SessionManager:
         log.info("session %s closing — %.0fs, %.2f gal", session_id, duration_seconds, volume)
         await self._emit_session(
             session_id, started_at, ended_at, duration_seconds, volume,
-            bathroom_id, confidence_score, attribution_state,
+            bathroom_id, confidence_score, attribution_state, all_scores,
         )
 
     def _attribute_session(self) -> tuple[str, float, str]:
@@ -196,6 +218,9 @@ class SessionManager:
         self._last_flow_rate = 0.0
         self._volume_accumulated = 0.0
         self._close_task = None
+        if self._score_emit_task and not self._score_emit_task.done():
+            self._score_emit_task.cancel()
+        self._score_emit_task = None
         self._humidity_peak_slope = {bid: 0.0 for bid in self._bathroom_ids}
         self._humidity_peak_delta = {bid: 0.0 for bid in self._bathroom_ids}
         self._temperature_peak_slope = {bid: 0.0 for bid in self._bathroom_ids}
@@ -215,6 +240,7 @@ class SessionManager:
         bathroom_id: str,
         confidence_score: float,
         attribution_state: str,
+        all_scores: dict[str, float],
     ) -> None:
         payload = {
             "session_id": session_id,
@@ -225,10 +251,14 @@ class SessionManager:
             "duration_seconds": int(duration_seconds),
             "volume_gallons": round(volume_gallons, 3),
             "confidence_score": round(confidence_score, 3),
+            "scores": all_scores,
             "cost_estimate": None,
         }
-        await self._producer.send("home.showers", value=json.dumps(payload).encode())
-        log.info("emitted session %s to home.showers", session_id)
+        try:
+            await self._producer.send("home.showers", value=json.dumps(payload).encode())
+            log.info("emitted session %s to home.showers", session_id)
+        except Exception as exc:
+            log.error("failed to emit session %s: %s", session_id, exc)
 
     def on_bathroom_message(self, msg: dict) -> None:
         bathroom_id: str = msg.get("bathroom_id", "")
@@ -243,7 +273,8 @@ class SessionManager:
             new_val: float = msg["humidity"]
             dq = self._humidity_history[bathroom_id]
             if self._session_open and dq:
-                prev_ts, prev_val = dq[-1]
+                lookback = min(3, len(dq))
+                prev_ts, prev_val = dq[-lookback]
                 elapsed = ts_float - prev_ts
                 if elapsed > 0:
                     slope = (new_val - prev_val) / elapsed
@@ -263,7 +294,8 @@ class SessionManager:
             new_val = msg["temperature"]
             dq = self._temperature_history[bathroom_id]
             if self._session_open and dq:
-                prev_ts, prev_val = dq[-1]
+                lookback = min(3, len(dq))
+                prev_ts, prev_val = dq[-lookback]
                 elapsed = ts_float - prev_ts
                 if elapsed > 0:
                     slope = (new_val - prev_val) / elapsed
