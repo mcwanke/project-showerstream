@@ -1,6 +1,10 @@
 # PROJECT_SPEC.md — Shower Detection Pipeline
 
-## Current Phase: Phase 1
+## Current Phase: Phase 3 (in progress)
+
+- Phase 1 (ha-producer) — complete
+- Phase 2 (shower-detector) — complete
+- Phase 3 (influxdb-sink, Grafana dashboards) — next
 
 ---
 
@@ -41,10 +45,12 @@ These are already exposed as HA sensors and will be streamed alongside raw readi
 
 A shower session is defined as:
 
-- **Opens:** Water flow rate rises above the minimum flow threshold (configurable, `FLOW_ZERO_TIMEOUT_SECONDS`)
-- **Closes:** Water flow rate drops to 0 and remains at 0 for 15 consecutive seconds
+- **Opens:** `flow_rate_gpm` rises to or above `MIN_FLOW_RATE_OPEN` (default: 0.5 GPM)
+- **Closes:** `flow_rate_gpm` drops below `MIN_FLOW_RATE_CLOSE` (default: 0.1 GPM) and remains there for `FLOW_ZERO_TIMEOUT_SECONDS` (default: 10 seconds)
 
-This logic is already implemented in Home Assistant via the water volume sensor reset. The pipeline respects this boundary — when `sensor.water_volume` resets to 0, the current session is closed and a session event is emitted to `home.showers`.
+Two separate thresholds are used intentionally. The higher open threshold prevents spurious session starts from momentary flow blips. The lower close threshold prevents session bouncing if flow dips briefly mid-shower (e.g. pressure fluctuation). Flow between the two thresholds is held — the session neither opens nor starts a close timer.
+
+Volume is accumulated by the detector using trapezoidal integration of the `flow_rate_gpm` signal — no dependency on the HA volume sensor reset.
 
 ### Edge Cases
 
@@ -67,44 +73,37 @@ Water flow rate must be above the minimum threshold to open a session. If flow i
 
 ### Confidence Score Components
 
+All signals are normalized to [0, 1] and summed. Maximum possible score is 1.0.
+
 | Signal | Weight | Notes |
 |---|---|---|
-| Water meter slope increasing | High | Flow rate actively rising confirms water is running |
-| Humidity slope rising steeply (bathroom X) | High | Primary attribution signal. Unique fingerprint for shower activity. |
-| Humidity above 12h rolling average (bathroom X) | Medium | Confirms elevated state, but slope is more important than absolute level |
-| Lights on (bathroom X) | Medium | Strong positive signal but not required. One bathroom has no smart lights. |
-| No competing humidity slopes in other bathrooms | Low | Increases confidence when other bathrooms are clearly inactive |
+| Humidity slope (peak, span-3) | 30% | Primary attribution signal — rate of change over 3-reading lookback, normalized by `HUMIDITY_SLOPE_NORM` |
+| Humidity delta above 12h avg (peak) | 25% | Confirms elevated state relative to dynamic baseline, normalized by `HUMIDITY_DELTA_NORM` |
+| Temperature slope (peak, span-3) | 15% | Secondary confirmation signal, normalized by `TEMPERATURE_SLOPE_NORM` |
+| Temperature delta above 12h avg (peak) | 15% | Secondary confirmation, normalized by `TEMPERATURE_DELTA_NORM` |
+| Light (shower zone) seen during session | 5% | Positive signal, not required |
+| Light (room) seen during session | 5% | Positive signal, not required |
+| Fan seen during session | 5% | Positive signal, not required |
 
-### Humidity Slope Calculation
+Peak values are tracked per session and only move upward — a single strong reading contributes even if later readings level off. All norm constants are configurable in `.env` for post-deployment tuning.
 
-Slope is calculated as the rate of humidity change over a **3-minute rolling window**. A steep positive slope (shower) is distinguishable from:
-- Flat/declining elevated humidity (residual from prior shower or environmental cause)
-- Gradual ambient humidity rise (not a shower)
+**Signals considered but not implemented:**
+- *Water meter slope* — shower flow settles to a steady state quickly after opening; slope provides minimal additional signal
+- *Competing bathroom suppression* — adds a bonus when the winner's slope significantly exceeds others; deferred until real attribution errors justify the complexity
 
-Threshold for "steep" slope is configurable and should be tuned against real session data after Phase 1.
+### Slope Calculation
 
-### Timing
-
-Based on observed data, humidity in the active bathroom crosses the 12h rolling average threshold within approximately **2 minutes** of shower start. The confirmation window is set to `HUMIDITY_CONFIRMATION_WINDOW_SECONDS` (default: 180 seconds).
+Slope is calculated as rise-over-run between the current reading and the reading 3 positions back in the sensor history deque (span-3 lookback). The history deque is trimmed to a 3-minute window, so span-3 represents the 3 most recent readings within that window. This smooths single outlier readings without requiring a full windowed regression.
 
 ### Attribution States
 
-Each session moves through these states:
+Attribution is computed once when the session closes. The detector picks the highest-scoring bathroom and assigns one of three states:
 
-```
-PENDING → ATTRIBUTED (temporary) → CONFIRMED
-                                  ↓
-                             CONFIRMED_FINAL (on session close)
-```
+- **CONFIRMED** — winning score ≥ `ATTRIBUTION_CONFIRMED_THRESHOLD` (default: 0.6). High confidence.
+- **ATTRIBUTED** — winning score ≥ `ATTRIBUTION_MIN_THRESHOLD` (default: 0.3) but below the confirmed threshold. Moderate confidence.
+- **FALLBACK** — no bathroom cleared the minimum threshold. Session attributed to the first bathroom in `BATHROOM_PRIORITY_ORDER` that has any score.
 
-- **PENDING:** Flow started, no bathroom has cleared the score threshold yet. Falls back to priority order if window expires.
-- **ATTRIBUTED (temporary):** One bathroom has the highest score but humidity hasn't confirmed yet.
-- **CONFIRMED:** Humidity slope has confirmed the attribution. High confidence.
-- **CONFIRMED_FINAL:** Session closed (flow → 0). Final event emitted to `home.showers`.
-
-### Bathroom Priority Order (tiebreaker / fallback)
-
-If no bathroom clears the confidence threshold within the confirmation window, the session is attributed to the highest-priority bathroom with lights on, or the default priority order if no lights signal is available. Priority order is configurable in `.env`.
+Real-time score visibility during an active session is provided by the `home.shower_scores` topic, emitted every `SCORE_EMIT_INTERVAL_SECONDS`. This is separate from the final attribution and intended for monitoring and model tuning.
 
 ---
 
@@ -112,16 +111,16 @@ If no bathroom clears the confidence threshold within the confirmation window, t
 
 ### `home.water`
 
-Water meter readings. Produced on every state change from HA.
+Water meter readings. One message per HA `state_changed` event — each message contains a single field, either `flow_rate_gpm` or `volume_gallons`, never both.
 
 ```json
-{
-  "timestamp": "2024-01-15T20:41:00.000Z",
-  "flow_rate_gpm": 2.3,
-  "volume_gallons": 12.4,
-  "session_active": true
-}
+{ "timestamp": "2024-01-15T20:41:00.000Z", "flow_rate_gpm": 2.3 }
 ```
+```json
+{ "timestamp": "2024-01-15T20:41:01.000Z", "volume_gallons": 12.4 }
+```
+
+The detector uses only `flow_rate_gpm` for session open/close logic and volume integration. The `volume_gallons` field is available in the topic for downstream consumers (e.g. InfluxDB raw flow visualization).
 
 ### `home.bathrooms`
 
@@ -146,13 +145,28 @@ Detected shower sessions. Written by the stream processor when a session closes.
 {
   "session_id": "uuid",
   "bathroom_id": "bath1",
+  "attribution_state": "CONFIRMED",
   "started_at": "2024-01-15T20:41:00.000Z",
   "ended_at": "2024-01-15T21:00:00.000Z",
   "duration_seconds": 1140,
   "volume_gallons": 57.2,
-  "attribution_state": "CONFIRMED",
   "confidence_score": 0.87,
+  "scores": { "bath1": 0.87, "bath2": 0.12, "bath3": 0.05 },
   "cost_estimate": null
+}
+```
+
+`scores` contains the final score for every bathroom at session close, not just the winner. `cost_estimate` is null here and populated by downstream cost rollup logic.
+
+### `home.shower_scores`
+
+Per-bathroom scores emitted every `SCORE_EMIT_INTERVAL_SECONDS` during an active session. Used for real-time monitoring and model tuning in Grafana.
+
+```json
+{
+  "session_id": "uuid",
+  "timestamp": "2024-01-15T20:43:00.000Z",
+  "scores": { "bath1": 0.45, "bath2": 0.08, "bath3": 0.02 }
 }
 ```
 
@@ -253,15 +267,29 @@ INFLUXDB_ORG=your_org
 INFLUXDB_BUCKET=home_water
 
 # Water cost
-WATER_COST_PER_GALLON=0.01
+WATER_COST_PER_GALLON=0.018
 
 # Session logic
-FLOW_ZERO_TIMEOUT_SECONDS=15
-HUMIDITY_CONFIRMATION_WINDOW_SECONDS=180
-MIN_FLOW_RATE_GPM=0.5
+MIN_FLOW_RATE_OPEN=0.5          # GPM threshold to open a session
+MIN_FLOW_RATE_CLOSE=0.1         # GPM threshold to start the close timer (hysteresis)
+FLOW_ZERO_TIMEOUT_SECONDS=10    # Seconds below MIN_FLOW_RATE_CLOSE before session closes
+MIN_SHOWER_DURATION_SECONDS=180 # Sessions shorter than this are discarded
 
 # Attribution fallback priority (comma-separated bathroom IDs, first = highest priority)
 BATHROOM_PRIORITY_ORDER=bath1,bath2,bath3
+
+# Attribution scoring thresholds
+ATTRIBUTION_CONFIRMED_THRESHOLD=0.6
+ATTRIBUTION_MIN_THRESHOLD=0.3
+
+# Score normalization constants (tune against real session data)
+HUMIDITY_SLOPE_NORM=0.05
+HUMIDITY_DELTA_NORM=15.0
+TEMPERATURE_SLOPE_NORM=0.02
+TEMPERATURE_DELTA_NORM=5.0
+
+# Score reporting interval (seconds) during active sessions
+SCORE_EMIT_INTERVAL_SECONDS=30
 ```
 
 ---
@@ -287,11 +315,16 @@ Water meter:
 | Decision | Rationale |
 |---|---|
 | Redpanda over vanilla Kafka | Single binary, Kafka-compatible, built-in UI — much friendlier for homelab |
-| Faust over Kafka Streams | Python-native, lower barrier to entry, sufficient for this scale |
+| aiokafka directly over faust-streaming | faust-streaming dependency chain (aiokafka + kafka-python) is fragile on Python 3.11+; aiokafka standalone is stable |
 | Confidence scoring over binary logic | One bathroom has no smart lights; scoring handles missing signals gracefully |
 | Humidity slope over threshold crossing | Slope is a more reliable real-time signal; threshold crossing has too much lag and ambient interference |
-| 3-minute confirmation window | Based on observed data: humidity crosses threshold within ~2 minutes of shower start |
+| Attribution at session close, not real-time | Scores accumulate peak values throughout the session; final attribution is more accurate than a mid-session snapshot |
+| Peak signal tracking | A single strong humidity slope reading early in the session remains the attribution signal even if humidity plateaus later |
+| Two-threshold hysteresis (open/close) | Prevents session bouncing from momentary pressure fluctuations without requiring debounce logic |
+| Temperature included in scoring | Adds 30% weight alongside humidity; validated in real sessions — both signals contribute |
+| Span-3 slope lookback | Smooths single outlier sensor readings without adding windowed regression complexity |
+| home.shower_scores topic | Provides real-time score visibility for Grafana tuning without changing the session-close payload |
 | Output topic (`home.showers`) | Decouples detection from downstream consumers; consumers don't need to know detection logic |
 | InfluxDB over TimescaleDB | Already running in homelab; purpose-built for time-series; avoids adding another database |
+| cost-aggregator as InfluxDB Flux tasks | Avoids a separate running container; rollup logic lives where the data lives |
 | Overlapping showers ignored | Rare edge case; first attribution wins; not worth the complexity to solve now |
-| 15s zero-flow timeout delegated to HA | Already implemented and working; no reason to reimplement in the pipeline |

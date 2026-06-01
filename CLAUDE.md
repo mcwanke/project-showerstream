@@ -71,25 +71,17 @@ The full design rationale and architecture decisions are documented in `PROJECT_
 shower-pipeline/
 ├── CLAUDE.md                  # This file
 ├── PROJECT_SPEC.md            # Full design spec and architecture decisions
-├── docker-compose.yml         # Full stack definition
+├── config.example.yaml        # Sanitized entity map template (safe to commit)
+├── docker-compose.yml         # Reference stack definition (live stack runs on Unraid via Arcane)
 ├── .env.example               # Environment variable template (never commit .env)
 ├── ha-producer/
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── producer.py            # HA WebSocket → Kafka producer
-├── shower-detector/
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   └── detector.py            # Faust stream processor / session state machine
-└── consumers/
-    ├── influxdb-sink/
-    │   ├── Dockerfile
-    │   ├── requirements.txt
-    │   └── sink.py            # Writes all session events to InfluxDB
-    └── cost-aggregator/
-        ├── Dockerfile
-        ├── requirements.txt
-        └── aggregator.py      # Daily/weekly usage and cost rollups
+└── shower-detector/
+    ├── Dockerfile
+    ├── requirements.txt
+    └── detector.py            # aiokafka session state machine + attribution scorer
 ```
 
 ---
@@ -99,7 +91,7 @@ shower-pipeline/
 | Component | Technology |
 |---|---|
 | Message broker | Redpanda (Kafka-compatible) |
-| Stream processing | Faust (Python) |
+| Stream processing | aiokafka (Python, direct — no Faust) |
 | Producer | kafka-python + websockets |
 | Storage | InfluxDB 2.7 (existing instance) |
 | Visualization | Grafana (existing instance) |
@@ -122,8 +114,9 @@ Key variables:
 - `INFLUXDB_ORG` — InfluxDB organization name
 - `INFLUXDB_BUCKET` — Target bucket (e.g. `home_water`)
 - `WATER_COST_PER_GALLON` — Configurable water rate for cost calculations
-- `FLOW_ZERO_TIMEOUT_SECONDS` — Seconds of zero flow before session closes (default: 15)
-- `HUMIDITY_CONFIRMATION_WINDOW_SECONDS` — Max window to wait for humidity confirmation (default: 180)
+- `MIN_FLOW_RATE_OPEN` — GPM threshold to open a session (default: 0.5)
+- `MIN_FLOW_RATE_CLOSE` — GPM threshold to start the close timer (default: 0.1)
+- `FLOW_ZERO_TIMEOUT_SECONDS` — Seconds below close threshold before session closes (default: 10)
 
 ---
 
@@ -131,15 +124,16 @@ Key variables:
 
 | Topic | Description | Partitioning |
 |---|---|---|
-| `home.water` | Water meter readings: flow_rate (gal/min), cumulative_volume (gal) | Single partition |
-| `home.bathrooms` | Bathroom sensor events: humidity, temperature, light state | Partitioned by bathroom_id |
+| `home.water` | Water meter readings: one message per HA event, single field (flow_rate_gpm or volume_gallons) | Single partition |
+| `home.bathrooms` | Bathroom sensor events: humidity, temperature, baselines, device states | Partitioned by bathroom_id |
 | `home.showers` | Detected and attributed shower sessions (output topic) | Single partition |
+| `home.shower_scores` | Per-bathroom scores emitted every `SCORE_EMIT_INTERVAL_SECONDS` during active sessions | Single partition |
 
 ---
 
 ## Bathroom IDs
 
-Bathrooms are identified by string IDs that map to Home Assistant entity names:
+Bathrooms are identified by string IDs defined in `config.yaml` (gitignored — never commit real entity IDs). The table below uses placeholder IDs matching `config.example.yaml`.
 
 | Bathroom ID | HA Entities |
 |---|---|
@@ -147,7 +141,7 @@ Bathrooms are identified by string IDs that map to Home Assistant entity names:
 | `bath2` | `sensor.bath2_humidity`, `sensor.bath2_temperature` |
 | `bath3` | `sensor.bath3_humidity`, `sensor.bath3_temperature` |
 
-Light entities vary per bathroom — see `PROJECT_SPEC.md` for details. One bathroom has no smart lights.
+Actual IDs are loaded at runtime from `config.yaml` — never hardcode them in any service code. One bathroom has no smart lights; the scoring model handles missing device signals gracefully.
 
 ---
 
@@ -155,12 +149,13 @@ Light entities vary per bathroom — see `PROJECT_SPEC.md` for details. One bath
 
 See `PROJECT_SPEC.md` for the full scoring model. Key rules:
 
-1. Water flow rate crossing the minimum threshold is a **hard gate** — no session opens without it
-2. Sessions close after `FLOW_ZERO_TIMEOUT_SECONDS` of sustained zero flow
-3. Attribution uses a per-bathroom confidence score — highest scoring bathroom wins
-4. Humidity slope (rate of change over a rolling 3-minute window) is the primary attribution signal
-5. Lights are a medium-weight signal — one bathroom has no smart lights, so lights are never required
-6. Overlapping showers (two running simultaneously) are not handled — first attribution wins
+1. Session opens when `flow_rate_gpm` ≥ `MIN_FLOW_RATE_OPEN` (hard gate — no scoring without active flow)
+2. Close timer starts when `flow_rate_gpm` drops below `MIN_FLOW_RATE_CLOSE`; two thresholds prevent bouncing
+3. Sessions shorter than `MIN_SHOWER_DURATION_SECONDS` are discarded on close
+4. Attribution is computed once at session close — scores accumulate peak values throughout the session
+5. Scoring uses 7 signals: humidity slope (30%), humidity delta (25%), temperature slope (15%), temperature delta (15%), light_shower (5%), light_room (5%), fan (5%)
+6. Attribution state is CONFIRMED / ATTRIBUTED / FALLBACK based on the winning score vs. configurable thresholds
+7. Overlapping showers (two running simultaneously) are not handled — first attribution wins
 
 ---
 
@@ -197,10 +192,8 @@ open http://localhost:8080
 
 ## Phased Build Plan
 
-This project is being built in phases. Do not skip ahead.
-
-- **Phase 1** — Redpanda + `ha-producer` only. Goal: get real HA events flowing into Kafka topics and visible in the Redpanda UI.
-- **Phase 2** — Add `shower-detector`. Goal: session state machine running, attributed sessions appearing in `home.showers`.
-- **Phase 3** — Add `influxdb-sink`, `cost-aggregator`, Grafana dashboards, and HA feedback.
+- **Phase 1** ✓ — Redpanda + `ha-producer`. Real HA events flowing into Kafka topics, visible in Redpanda Console.
+- **Phase 2** ✓ — `shower-detector`. Session state machine running, attributed sessions emitted to `home.showers`, per-bathroom scores emitted to `home.shower_scores`.
+- **Phase 3** (in progress) — `influxdb-sink`: consume `home.showers` and `home.shower_scores`, write session records and score timelines to InfluxDB. Cost rollups via InfluxDB Flux tasks. Grafana dashboards.
 
 The current phase is indicated in `PROJECT_SPEC.md`.
